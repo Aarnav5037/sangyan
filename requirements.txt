@@ -11,7 +11,7 @@ python-Levenshtein>=0.21.0     # optional: speeds up fuzzywuzzy and removes its 
 
 # Domain age lookup. Install "python-whois", NOT "whois" (different package, same import name)
 python-whois>=0.9.4
-
+google
 # Gemini (report + multimodal analysis)
 google-generativeai>=0.8.0
 
