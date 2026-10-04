@@ -1,5 +1,7 @@
 🛡️ Sangyan: Multi-Vector Fraud & Scam Interceptor
 
+https://sangyan-investor-shield.streamlit.app/
+
 Verify before you trust. Sangyan checks a suspicious message, link, screenshot or voice note against real registries, explains the risk in the user's own language, and helps them report it.
 
 **Idea**
