@@ -354,78 +354,384 @@ def enhance_complaint_with_gemini(raw_complaint: str, api_key: str = None) -> st
 
 
 # ---------------------------------------------------------
-# Streamlit UI Component
+# Grievance & Complaint Assistant (redesigned)
+# ---------------------------------------------------------
+# Drop-in replacement. Same function name and signature.
+# Still uses your generate_raw_complaint_dossier() and enhance_complaint_with_gemini().
+# Imports needed:
+import datetime
+import hashlib
+import html
+import re
+
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+
+PHONE_RE = re.compile(r"^(?:\+?91)?[6-9]\d{9}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+
+# Placeholders double as the demo values used by "Fill example" and Tab-to-fill
+PH = {
+    "gv_name": "e.g., Rajesh Kumar",
+    "gv_phone": "e.g., +91 9876543210",
+    "gv_email": "e.g., rajesh@example.com",
+    "gv_entity": "e.g., VIP Trading Signals Telegram",
+}
+EXAMPLE = {k: re.sub(r"^e\.g\.,?\s*", "", v) for k, v in PH.items()}
+
+PORTALS = {
+    "cyber": {
+        "title": "National Cyber Crime Portal and 1930 helpline",
+        "url": "https://cybercrime.gov.in",
+        "blurb": "Main route for online financial fraud, UPI scams and phishing links.",
+        "steps": [
+            "If money was sent, call **1930** right away. Faster reporting improves the chance of holding the funds.",
+            "File the detailed report at cybercrime.gov.in under financial fraud.",
+            "Attach this dossier and your evidence, and note the acknowledgement number.",
+        ],
+    },
+    "scores": {
+        "title": "SEBI SCORES 2.0",
+        "url": "https://scores.sebi.gov.in",
+        "blurb": "Best when a SEBI-registered intermediary is involved or a SEBI registration number is being misused. "
+                 "Check on the portal whether your case category is accepted.",
+        "steps": [
+            "Create an account or log in on scores.sebi.gov.in.",
+            "Choose the entity and category that best match your case.",
+            "Paste the complaint text, attach evidence, and save the registration number.",
+        ],
+    },
+    "nsdl": {
+        "title": "NSDL investor grievance",
+        "url": "https://nsdl.co.in",
+        "blurb": "For demat-account or depository-related disputes.",
+        "steps": [
+            "Use this only if your demat account or a depository participant is involved.",
+            "Find the investor grievance section on nsdl.co.in and submit the complaint with evidence.",
+        ],
+    },
+}
+
+CHECKLIST = [
+    "Screenshots of the message, profile or channel",
+    "Transaction IDs / UTR numbers and bank statement (if money was sent)",
+    "Phone numbers, UPI IDs and links involved",
+    "This complaint draft",
+]
+
+
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
+def _inject_css():
+    st.markdown(
+        """
+        <style>
+        .gv-paper { border:1px solid rgba(128,128,128,.35); border-radius:10px;
+                    background:rgba(128,128,128,.06); padding:1.1rem 1.3rem; }
+        .gv-meta  { display:flex; justify-content:space-between; flex-wrap:wrap; gap:.5rem;
+                    font-size:.8rem; opacity:.75; border-bottom:1px solid rgba(128,128,128,.3);
+                    padding-bottom:.5rem; margin-bottom:.8rem; }
+        .gv-body  { white-space:pre-wrap; font-family:Georgia,'Times New Roman',serif;
+                    line-height:1.65; font-size:.95rem; max-height:430px; overflow:auto; }
+        .gv-pill  { display:inline-block; padding:.15rem .6rem; border-radius:999px;
+                    font-size:.78rem; font-weight:600; color:#fff; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _risk_band(score: int):
+    if score >= 60:
+        return "High risk", "#d64545"
+    if score >= 30:
+        return "Medium risk", "#e08a1e"
+    return "Low risk", "#2e9e5b"
+
+
+def _detected_entity(payload: dict) -> str:
+    """Best guess of the scammer / impersonated entity from the engine output."""
+    for a in payload.get("sebi_audit", []):
+        claimed = a.get("claimed_entity", "")
+        if "VERIFIED" not in a.get("status", "") and claimed and not claimed.startswith("Unspecified"):
+            return claimed
+    for d in payload.get("domain_audit", []):
+        if d.get("is_typosquat"):
+            brand = d.get("impersonated_brand")
+            return f"Fake {brand.title()} website ({d['domain']})" if brand else f"Fake website ({d['domain']})"
+    return ""
+
+
+def _recommend(payload: dict, loss: float) -> list:
+    """Order the filing routes by relevance to this case."""
+    order = []
+    if loss > 0:
+        order.append("cyber")                      # time-sensitive when money has left the account
+    if any("VERIFIED" not in a.get("status", "") for a in payload.get("sebi_audit", [])):
+        order.append("scores")
+    if "cyber" not in order:
+        order.append("cyber")
+    if "scores" not in order:
+        order.append("scores")
+    order.append("nsdl")
+    return order
+
+
+def _evidence(payload: dict):
+    sebi = pd.DataFrame([{
+        "SEBI ID": a.get("id"), "Status": a.get("status"), "Official name": a.get("official_name"),
+        "Claimed entity": a.get("claimed_entity"), "Details": a.get("reason"),
+    } for a in payload.get("sebi_audit", [])])
+    dom = pd.DataFrame([{
+        "Domain": d.get("domain"), "Impersonation": "Yes" if d.get("is_typosquat") else "No",
+        "Age (days)": d.get("domain_age_days"), "Flags": "; ".join(d.get("flags", [])),
+    } for d in payload.get("domain_audit", [])])
+    ling = pd.DataFrame([{
+        "Phrase": f.get("trigger_phrase"), "Why it is a red flag": f.get("description"),
+    } for f in payload.get("linguistic_flags", [])])
+    return sebi, dom, ling
+
+
+def _indicator_list(payload: dict) -> list:
+    items = [a["id"] for a in payload.get("sebi_audit", []) if a.get("id")]
+    items += [d["domain"] for d in payload.get("domain_audit", []) if d.get("domain")]
+    return items
+
+
+def _build_html(ref: str, meta: dict, text: str) -> str:
+    """Standalone, print-ready HTML (open it and press Ctrl+P to save as PDF)."""
+    esc = html.escape
+    sebi, dom, ling = _evidence(meta["payload"])
+
+    def table(title, df):
+        if df.empty:
+            return ""
+        head = "".join(f"<th>{esc(str(c))}</th>" for c in df.columns)
+        rows = "".join("<tr>" + "".join(f"<td>{esc(str(v))}</td>" for v in r) + "</tr>"
+                       for r in df.itertuples(index=False))
+        return f"<h3>{esc(title)}</h3><table><tr>{head}</tr>{rows}</table>"
+
+    label, color = _risk_band(meta["risk"])
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Complaint {esc(ref)}</title>
+<style>
+ body{{font-family:Georgia,'Times New Roman',serif;max-width:800px;margin:2rem auto;padding:0 1rem;color:#111;line-height:1.6}}
+ h1{{font-size:1.4rem;margin-bottom:.2rem}} .meta{{color:#555;font-size:.9rem;border-bottom:1px solid #ccc;padding-bottom:.6rem;margin-bottom:1rem}}
+ .pill{{background:{color};color:#fff;border-radius:999px;padding:.1rem .6rem;font-size:.8rem}}
+ pre{{white-space:pre-wrap;font-family:inherit}} table{{border-collapse:collapse;width:100%;font-size:.85rem;margin:.5rem 0 1.2rem}}
+ th,td{{border:1px solid #bbb;padding:.35rem .5rem;text-align:left;vertical-align:top}} th{{background:#f0f0f0}}
+ .note{{font-size:.8rem;color:#666;margin-top:2rem}}
+ @media print{{body{{margin:0}}}}
+</style></head><body>
+<h1>Complaint Dossier</h1>
+<div class="meta">Reference: <b>{esc(ref)}</b> &nbsp;|&nbsp; Date: {esc(meta['date'])} &nbsp;|&nbsp;
+Automated risk assessment: <span class="pill">{esc(label)} ({meta['risk']}/100)</span></div>
+<pre>{esc(text)}</pre>
+<h2>Annexure: Evidence summary</h2>
+{table("SEBI registration checks", sebi)}{table("Domains", dom)}{table("Language red flags", ling)}
+<p class="note">Generated by Sangyan. This draft is an aid, not legal advice. Please verify every detail before filing.</p>
+</body></html>"""
+
+
+def _fill_example():
+    st.session_state.update(EXAMPLE)
+
+
+def _use_detected(value: str):
+    st.session_state["gv_entity"] = value
+
+
+def _sync_edit():
+    st.session_state["gv_dossier"] = st.session_state["gv_edit"]
+
+
+def _tab_to_fill(enabled: bool):
+    """
+    Demo helper: pressing Tab in an EMPTY field inside the form fills it with its placeholder
+    example (a second Tab moves on). Streamlit has no native feature for this, so a small script
+    attaches one listener to the parent page. It only works inside st.form fields.
+    """
+    components.html(
+        f"""
+        <script>
+        const doc = window.parent.document;
+        doc.__sangyanTabFill = {str(enabled).lower()};
+        if (!doc.__sangyanTabInstalled) {{
+          doc.__sangyanTabInstalled = true;
+          doc.addEventListener('keydown', function (e) {{
+            if (!doc.__sangyanTabFill || e.key !== 'Tab' || e.shiftKey) return;
+            const el = doc.activeElement;
+            if (!el || !['INPUT', 'TEXTAREA'].includes(el.tagName)) return;
+            if (!el.closest('[data-testid="stForm"]')) return;
+            if (el.value !== '' || !el.placeholder) return;
+            const text = el.placeholder.replace(/^e\\.g\\.,?\\s*/i, '');
+            const proto = el.tagName === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+            Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, text);
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            e.preventDefault();
+          }}, true);
+        }}
+        </script>
+        """,
+        height=0,
+    )
+
+
+# ---------------------------------------------------------
+# Main tab
 # ---------------------------------------------------------
 def render_grievance_redressal_tab(extracted_payload: dict, risk_score: int, api_key: str = None):
     """Renders the Grievance & Complaint Dossier Generation UI."""
-    st.subheader("📝 Automated Grievance & Complaint Assistant")
-    st.caption("Generate a pre-formatted, legal-ready complaint dossier for SCORES 2.0, NSDL, or 1930 Cyber Crime Portal.")
+    ss = st.session_state
+    _inject_css()
 
-    st.markdown("---")
+    st.subheader("📝 Grievance and complaint assistant")
+    st.caption("Generate a ready-to-file complaint dossier for SCORES 2.0, NSDL or the 1930 Cyber Crime portal.")
 
-    col_form, col_preview = st.columns([1, 1])
+    detected = _detected_entity(extracted_payload)
+    col_form, col_out = st.columns([5, 6], gap="large")
 
+    # ---------------- Step 1: form ----------------
     with col_form:
-        st.write("##### 👤 Step 1: Complainant & Incident Details")
-        user_name = st.text_input("Your Full Name:", placeholder="e.g., Rajesh Kumar")
-        user_phone = st.text_input("Contact Phone Number:", placeholder="e.g., +91 9876543210")
-        user_email = st.text_input("Email Address:", placeholder="e.g., rajesh@example.com")
-        
-        incident_date = st.date_input("Date of Incident:", datetime.date.today())
-        entity_name = st.text_input("Name of Scam Group / Impersonated Entity:", placeholder="e.g., VIP Trading Signals Telegram")
-        financial_loss = st.number_input("Financial Amount Lost (if any, in ₹):", min_value=0.0, step=500.0, value=0.0)
+        st.markdown("##### 👤 Step 1: Your details")
 
-        generate_btn = st.button("📄 Generate Formal Complaint Draft", type="primary", use_container_width=True)
+        demo = st.toggle(
+            "Demo mode: press Tab in an empty box to fill its example",
+            key="gv_demo",
+            help="For demos only. The examples are fake details; don't file a real complaint with them.",
+        )
+        b1, b2 = st.columns(2)
+        b1.button("Fill example details", on_click=_fill_example, use_container_width=True)
+        if detected:
+            b2.button("Use detected entity", on_click=_use_detected, args=(detected,),
+                      help=detected, use_container_width=True)
 
-    with col_preview:
-        st.write("##### 📄 Step 2: Generated Dossier & Action Plan")
-        
-        if generate_btn or "generated_dossier" in st.session_state:
-            if generate_btn:
-                # Generate initial draft
+        with st.form("gv_form"):
+            name = st.text_input("Full name *", key="gv_name", placeholder=PH["gv_name"])
+            c1, c2 = st.columns(2)
+            phone = c1.text_input("Mobile number *", key="gv_phone", placeholder=PH["gv_phone"])
+            email = c2.text_input("Email", key="gv_email", placeholder=PH["gv_email"])
+            c3, c4 = st.columns(2)
+            incident_date = c3.date_input("Date of incident", value=datetime.date.today(),
+                                          max_value=datetime.date.today(), key="gv_date")
+            loss = c4.number_input("Amount lost (₹)", min_value=0.0, step=500.0, key="gv_loss")
+            entity = st.text_input("Scam group / impersonated entity", key="gv_entity",
+                                   placeholder=PH["gv_entity"])
+            submitted = st.form_submit_button("📄 Generate complaint", type="primary",
+                                              use_container_width=True)
+
+        _tab_to_fill(demo)
+
+        if submitted:
+            errors = []
+            if len(name.strip()) < 3:
+                errors.append("Enter your full name.")
+            if not PHONE_RE.match(re.sub(r"[\s-]", "", phone)):
+                errors.append("Enter a valid 10-digit Indian mobile number.")
+            if email.strip() and not EMAIL_RE.match(email.strip()):
+                errors.append("That email address doesn't look right.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
                 raw_draft = generate_raw_complaint_dossier(
-                    complainant_name=user_name,
-                    contact_number=user_phone,
-                    email_id=user_email,
+                    complainant_name=name,
+                    contact_number=phone,
+                    email_id=email,
                     incident_date=incident_date.strftime("%d-%m-%Y"),
-                    entity_name=entity_name,
-                    financial_loss=financial_loss,
+                    entity_name=entity,
+                    financial_loss=loss,
                     extracted_entities=extracted_payload,
-                    risk_score=risk_score
+                    risk_score=risk_score,
                 )
-                
-                # Polish with Gemini if API key is provided
+                final_draft = raw_draft
                 if api_key:
-                    with st.spinner("Polishing draft with legal refinement..."):
+                    with st.spinner("Polishing the draft..."):
                         final_draft = enhance_complaint_with_gemini(raw_draft, api_key)
-                else:
-                    final_draft = raw_draft
-                    
-                st.session_state["generated_dossier"] = final_draft
 
-            # Render Complaint Text Area
-            dossier_text = st.session_state.get("generated_dossier", "")
-            st.text_area("Official Complaint Text:", value=dossier_text, height=320)
+                today = datetime.date.today()
+                tag = hashlib.sha1(f"{name}{phone}{datetime.datetime.now().isoformat()}".encode()).hexdigest()[:4].upper()
+                ss["gv_dossier"] = final_draft
+                ss["gv_edit"] = final_draft
+                ss["gv_ref"] = f"SGY-{today:%Y%m%d}-{tag}"
+                ss["gv_meta"] = {
+                    "date": today.strftime("%d-%m-%Y"), "loss": loss, "risk": risk_score,
+                    "entity": entity, "payload": extracted_payload,
+                }
 
-            # Action Buttons: Download & Links
-            st.download_button(
-                label="📥 Download Complaint (.txt)",
-                data=dossier_text,
-                file_name=f"SEBI_Complaint_Dossier_{datetime.date.today()}.txt",
-                mime="text/plain",
-                use_container_width=True
+    # ---------------- Step 2: output ----------------
+    with col_out:
+        st.markdown("##### 📄 Step 2: Your complaint dossier")
+
+        if "gv_dossier" not in ss:
+            st.info("👈 Fill in your details and click **Generate complaint**. "
+                    "Your draft, evidence summary and filing guide will appear here.")
+            return
+
+        meta, ref = ss["gv_meta"], ss["gv_ref"]
+        text = ss["gv_dossier"]
+        label, color = _risk_band(meta["risk"])
+        sebi_df, dom_df, ling_df = _evidence(meta["payload"])
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Risk score", f"{meta['risk']}/100")
+        m2.metric("Amount lost", f"₹{meta['loss']:,.0f}")
+        m3.metric("Evidence items", len(sebi_df) + len(dom_df) + len(ling_df))
+
+        t_view, t_evid, t_edit, t_file = st.tabs(["📄 Complaint", "🔎 Evidence", "✏️ Edit", "🚀 How to file"])
+
+        with t_view:
+            st.markdown(
+                f"""<div class="gv-paper">
+                      <div class="gv-meta"><span>Ref: <b>{html.escape(ref)}</b></span>
+                      <span>{html.escape(meta['date'])}</span>
+                      <span class="gv-pill" style="background:{color}">{label}</span></div>
+                      <div class="gv-body">{html.escape(text)}</div></div>""",
+                unsafe_allow_html=True,
             )
+            st.caption("This draft is an aid, not legal advice. Check every detail before filing.")
+
+        with t_evid:
+            st.caption("Attached as an annexure in the printable version.")
+            for title, df in (("SEBI registration checks", sebi_df), ("Domains", dom_df), ("Language red flags", ling_df)):
+                if not df.empty:
+                    st.markdown(f"**{title}**")
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+            if sebi_df.empty and dom_df.empty and ling_df.empty:
+                st.info("No automated evidence was captured for this complaint.")
+
+        with t_edit:
+            ss.setdefault("gv_edit", text)
+            st.text_area("Edit the draft. Downloads use this version.", key="gv_edit",
+                         height=340, on_change=_sync_edit)
+
+        with t_file:
+            st.markdown("**Before you file, gather:**")
+            for i, item in enumerate(CHECKLIST):
+                st.checkbox(item, key=f"gv_chk_{i}")
+            indicators = _indicator_list(meta["payload"])
+            if indicators:
+                st.markdown("**Indicators to paste into the forms:**")
+                st.code("\n".join(indicators), language=None)
 
             st.markdown("---")
-            st.write("##### 🚀 Where to File This Complaint:")
-            st.markdown("""
-            * **SEBI SCORES 2.0 Portal:** [scores.sebi.gov.in](https://scores.sebi.gov.in) *(For complaints against brokers, advisories, or depository participants)*
-            * **National Cyber Crime Reporting Portal:** [cybercrime.gov.in](https://cybercrime.gov.in) or Helpline **1930** *(For direct financial fraud / UPI scams)*
-            * **NSDL Investor Grievance Cell:** [nsdl.co.in](https://nsdl.co.in) *(For demat or nominee-related disputes)*[cite: 1, 3]
-            """)
-        else:
-            st.info("👈 Fill out the incident details on the left and click **'Generate Formal Complaint Draft'** to create your complaint dossier.")
+            for rank, key in enumerate(_recommend(meta["payload"], meta["loss"])):
+                p = PORTALS[key]
+                with st.container(border=True):
+                    st.markdown(f"**{p['title']}**" + ("  ·  ✅ Recommended first" if rank == 0 else ""))
+                    st.caption(p["blurb"])
+                    st.markdown("\n".join(f"{n}. {s}" for n, s in enumerate(p["steps"], 1)))
+                    st.link_button(f"Open {p['url'].replace('https://', '')}", p["url"])
 
+        d1, d2 = st.columns(2)
+        d1.download_button("📥 Download (.txt)", data=ss["gv_dossier"], file_name=f"{ref}.txt",
+                           mime="text/plain", use_container_width=True)
+        d2.download_button("🖨️ Printable (.html)", data=_build_html(ref, meta, ss["gv_dossier"]),
+                           file_name=f"{ref}.html", mime="text/html", use_container_width=True,
+                           help="Open the file and press Ctrl+P to save it as a PDF")
+        
 def analyze_and_synthesize_regional(user_text: str, context_json: dict, target_language_label: str, api_key: str = None):
     """
     1. Calls Gemini to generate an English detailed report AND a short regional summary script.
